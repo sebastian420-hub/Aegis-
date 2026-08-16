@@ -1,35 +1,25 @@
-const sqlite3 = require('sqlite3').verbose();
-const { open } = require('sqlite');
-const path = require('path');
+const { Pool } = require('pg');
+require('dotenv').config();
 
-let dbInstance = null;
+// Initialize the PostgreSQL connection pool
+// It will automatically use the DATABASE_URL environment variable if provided
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || 'postgres://localhost:5432/aegis_v3',
+    // Uncomment the line below if deploying to Render/Heroku which require SSL
+    // ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
-async function getDb() {
-    if (!dbInstance) {
-        dbInstance = await open({
-            filename: path.join(__dirname, 'sandbox.db'),
-            driver: sqlite3.Database
-        });
-    }
-    return dbInstance;
-}
+pool.on('error', (err, client) => {
+    console.error('Unexpected error on idle client', err);
+    process.exit(-1);
+});
 
-// Wrapper to mimic the PostgreSQL query structure
 async function query(text, params) {
-    const db = await getDb();
-    
-    // Convert PostgreSQL $1, $2 syntax to SQLite ?, ? syntax
-    let sqliteText = text.replace(/\$\d+/g, '?');
-    
-    // If it's a SELECT statement, return { rows: [] }
-    if (sqliteText.trim().toUpperCase().startsWith('SELECT')) {
-        const rows = await db.all(sqliteText, params);
-        return { rows };
-    }
-    
-    // For INSERT, UPDATE, DELETE
-    const result = await db.run(sqliteText, params);
-    return { rows: [], rowCount: result.changes };
+    const start = Date.now();
+    const res = await pool.query(text, params);
+    const duration = Date.now() - start;
+    // console.log('Executed query', { text, duration, rows: res.rowCount });
+    return res;
 }
 
-module.exports = { query };
+module.exports = { query, pool };
