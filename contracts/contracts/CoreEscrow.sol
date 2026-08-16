@@ -18,20 +18,31 @@ contract CoreEscrow is ReentrancyGuard {
         uint256 lockedAt;
     }
 
-    // Maps a unique UUID (transferId) to the locked funds
+    // Escrow State
     mapping(bytes32 => TransferLock) public lockedTransfers;
     mapping(bytes32 => bool) public usedSignatures;
+    
+    // Agent Staking State
+    mapping(address => uint256) public agentStakes;
+    mapping(bytes32 => bool) public usedSlashTickets;
 
-    // hardcoded chainId for Polygon Amoy (80002)
     bytes32 private immutable _DOMAIN_SEPARATOR;
 
+    // Upgraded TypeHashes for V3 Production
     bytes32 constant RELEASE_REQUEST_TYPEHASH = keccak256(
-        "ReleaseRequest(bytes32 transferId,address settlerNode,uint256 amount,uint256 deadline)"
+        "ReleaseRequest(bytes32 transferId,address settlerNode,uint256 settlerAmount,address feeTreasury,uint256 feeAmount,uint256 deadline)"
+    );
+
+    bytes32 constant SLASH_REQUEST_TYPEHASH = keccak256(
+        "SlashRequest(bytes32 slashNonce,address badAgent,address recipient,uint256 payoutAmount)"
     );
 
     event FundsLocked(bytes32 indexed transferId, address indexed sender, uint256 amount);
-    event FundsReleased(bytes32 indexed transferId, address indexed settlerNode, uint256 amount);
+    event FundsReleased(bytes32 indexed transferId, address indexed settlerNode, uint256 settlerAmount, uint256 feeAmount);
     event TransactionCancelled(bytes32 indexed transferId, address indexed sender, uint256 amount);
+    event StakeDeposited(address indexed agent, uint256 amount);
+    event StakeWithdrawn(address indexed agent, uint256 amount);
+    event AgentSlashed(address indexed badAgent, address indexed recipient, uint256 amount, bytes32 slashNonce);
 
     constructor(address _usdc, address _arbiter) {
         usdc = IERC20(_usdc);
@@ -41,16 +52,29 @@ contract CoreEscrow is ReentrancyGuard {
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256(bytes("AegisProtocol")),
-                keccak256(bytes("0.2")), // Upgraded to v0.2 for CICO
-                80002,
+                keccak256(bytes("0.3")), // Upgraded to V3 Production
+                80002, // Polygon Amoy
                 address(this)
             )
         );
     }
 
-    /**
-     * @dev Sender (Node A / Customer) calls this to lock USDC for a specific transfer
-     */
+    // --- AGENT STAKING ---
+    function depositStake(uint256 amount) external nonReentrant {
+        require(amount > 0, "Amount must be > 0");
+        require(usdc.transferFrom(msg.sender, address(this), amount), "USDC transfer failed");
+        agentStakes[msg.sender] += amount;
+        emit StakeDeposited(msg.sender, amount);
+    }
+
+    function withdrawStake(uint256 amount) external nonReentrant {
+        require(agentStakes[msg.sender] >= amount, "Insufficient stake");
+        agentStakes[msg.sender] -= amount;
+        require(usdc.transfer(msg.sender, amount), "USDC transfer failed");
+        emit StakeWithdrawn(msg.sender, amount);
+    }
+
+    // --- ESCROW MECHANICS ---
     function lockFunds(bytes32 transferId, uint256 amount) external nonReentrant {
         require(amount > 0, "Amount must be greater than zero");
         require(!lockedTransfers[transferId].isActive, "Transfer ID already in use");
@@ -67,60 +91,53 @@ contract CoreEscrow is ReentrancyGuard {
         emit FundsLocked(transferId, msg.sender, amount);
     }
 
-    /**
-     * @dev Node B calls this (or Relayer calls it) with Arbiter's signature verifying the OTP
-     */
     function releaseFunds(
         bytes32 transferId, 
         address settlerNode, 
-        uint256 amount, 
+        uint256 settlerAmount,
+        address feeTreasury,
+        uint256 feeAmount,
         uint256 deadline, 
         bytes calldata signature
     ) external nonReentrant {
         require(block.timestamp <= deadline, "Signature expired");
         require(!usedSignatures[transferId], "Transfer already settled");
         require(lockedTransfers[transferId].isActive, "No active lock for this transfer");
-        require(lockedTransfers[transferId].amount == amount, "Amount mismatch");
+        require(lockedTransfers[transferId].amount == (settlerAmount + feeAmount), "Amount mismatch");
 
         bytes32 structHash = keccak256(
             abi.encode(
                 RELEASE_REQUEST_TYPEHASH,
                 transferId,
                 settlerNode,
-                amount,
+                settlerAmount,
+                feeTreasury,
+                feeAmount,
                 deadline
             )
         );
 
-        bytes32 hash = keccak256(
-            abi.encodePacked(
-                "\x19\x01",
-                _DOMAIN_SEPARATOR,
-                structHash
-            )
-        );
-        
-        address signer = ECDSA.recover(hash, signature);
-        require(signer == arbiter, "Invalid arbiter signature");
+        bytes32 hash = keccak256(abi.encodePacked("\x19\x01", _DOMAIN_SEPARATOR, structHash));
+        require(ECDSA.recover(hash, signature) == arbiter, "Invalid arbiter signature");
 
-        // Checks-effects-interactions
         usedSignatures[transferId] = true;
         lockedTransfers[transferId].isActive = false;
         
-        require(usdc.transfer(settlerNode, amount), "USDC transfer failed");
-        emit FundsReleased(transferId, settlerNode, amount);
+        if (settlerAmount > 0) {
+            require(usdc.transfer(settlerNode, settlerAmount), "Settler transfer failed");
+        }
+        if (feeAmount > 0) {
+            require(usdc.transfer(feeTreasury, feeAmount), "Fee transfer failed");
+        }
+        
+        emit FundsReleased(transferId, settlerNode, settlerAmount, feeAmount);
     }
 
-    /**
-     * @dev Allows sender to reclaim funds if transfer fails, but only after a 30-minute lockup period.
-     *      This prevents the sender from stealing funds while the agent is actively handing them fiat.
-     */
     function refundExpired(bytes32 transferId) external nonReentrant {
         require(lockedTransfers[transferId].isActive, "No active lock");
         require(lockedTransfers[transferId].sender == msg.sender, "Not the sender");
         require(!usedSignatures[transferId], "Already settled");
         
-        // PANIC BUTTON TIMEOUT: 30 minutes
         require(block.timestamp >= lockedTransfers[transferId].lockedAt + 30 minutes, "Lockup period has not expired");
 
         lockedTransfers[transferId].isActive = false;
@@ -128,5 +145,36 @@ contract CoreEscrow is ReentrancyGuard {
 
         require(usdc.transfer(msg.sender, amount), "USDC transfer failed");
         emit TransactionCancelled(transferId, msg.sender, amount);
+    }
+
+    // --- SLASHING MECHANICS ---
+    function slashAgent(
+        bytes32 slashNonce,
+        address badAgent,
+        address recipient,
+        uint256 payoutAmount,
+        bytes calldata signature
+    ) external nonReentrant {
+        require(!usedSlashTickets[slashNonce], "Slash ticket already used");
+        require(agentStakes[badAgent] >= payoutAmount, "Agent stake too low");
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                SLASH_REQUEST_TYPEHASH,
+                slashNonce,
+                badAgent,
+                recipient,
+                payoutAmount
+            )
+        );
+
+        bytes32 hash = keccak256(abi.encodePacked("\x19\x01", _DOMAIN_SEPARATOR, structHash));
+        require(ECDSA.recover(hash, signature) == arbiter, "Invalid arbiter signature");
+
+        usedSlashTickets[slashNonce] = true;
+        agentStakes[badAgent] -= payoutAmount;
+        
+        require(usdc.transfer(recipient, payoutAmount), "Payout transfer failed");
+        emit AgentSlashed(badAgent, recipient, payoutAmount, slashNonce);
     }
 }
