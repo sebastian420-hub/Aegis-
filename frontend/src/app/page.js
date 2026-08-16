@@ -136,11 +136,18 @@ export default function Home() {
     setBalance(ethers.formatUnits(bal, 6));
   };
 
-  // Logout
-  const handleLogout = () => {
-    PasskeyManager.logout();
+  // Lock App (Hides dashboard, keeps wallet in storage)
+  const handleLockApp = () => {
     setWallet(null);
-    setHasPasskey(false);
+  };
+
+  // Delete Wallet (Permanently destroys the wallet)
+  const handleDeleteWallet = () => {
+    if (window.confirm("WARNING: This will permanently delete your wallet from this laptop. Continue?")) {
+      PasskeyManager.logout();
+      setWallet(null);
+      setHasPasskey(false);
+    }
   };
 
   // Poll for Feed & Statuses (abbreviated logic)
@@ -359,9 +366,14 @@ export default function Home() {
             Back
           </button>
         ) : (
-          <button onClick={handleLogout} style={{ background: 'transparent', border: '1px solid #ef4444', color: '#ef4444', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer' }}>
-            Logout
-          </button>
+          <div style={{ display: 'flex', gap: '10px' }}>
+            <button onClick={handleLockApp} style={{ background: 'transparent', border: '1px solid #10b981', color: '#10b981', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer' }}>
+              Lock App
+            </button>
+            <button onClick={handleDeleteWallet} style={{ background: 'transparent', border: '1px solid #ef4444', color: '#ef4444', padding: '5px 10px', borderRadius: '8px', cursor: 'pointer' }}>
+              Delete Wallet
+            </button>
+          </div>
         )}
       </div>
 
