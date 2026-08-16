@@ -12,9 +12,10 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const ARBITER_PRIVATE_KEY = process.env.ARBITER_PRIVATE_KEY;
 const CORE_ESCROW_ADDRESS = process.env.CORE_ESCROW_ADDRESS;
+const FEE_TREASURY_ADDRESS = process.env.FEE_TREASURY_ADDRESS || "0x9999999999999999999999999999999999999999";
 
 // ==========================================
-// Aegis Protocol V2: Unified Dispatcher Engine
+// Aegis Protocol V3: Production Arbiter Engine
 // ==========================================
 
 // 1. User broadcasts they want to sell USDC for Fiat
@@ -87,21 +88,17 @@ app.post('/confirm-lock', async (req, res) => {
     try {
         const { transfer_id, txHash } = req.body;
         
-        // Connect to RPC (Hardhat local for now)
         const provider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
         
-        // Wait for the transaction to be mined
         const receipt = await provider.waitForTransaction(txHash, 1, 15000);
         if (!receipt || receipt.status === 0) {
             return res.status(400).json({ error: 'Transaction failed or not found' });
         }
 
-        // Validate it was sent to the Escrow Contract
         if (receipt.to.toLowerCase() !== CORE_ESCROW_ADDRESS.toLowerCase()) {
             return res.status(400).json({ error: 'Transaction sent to wrong contract' });
         }
 
-        // If verified, update the database
         await query(`UPDATE transfers SET status = 'LOCKED' WHERE transfer_id = $1 AND status = 'ACCEPTED'`, [transfer_id]);
         res.json({ success: true });
     } catch (err) {
@@ -110,7 +107,59 @@ app.post('/confirm-lock', async (req, res) => {
     }
 });
 
-// 6. Agent verifies OTP to claim funds
+// Helper to generate V3 EIP-712 Release Signatures
+async function generateV3ReleaseSignature(transfer_id, agent_wallet, amount_usdc) {
+    const wallet = new ethers.Wallet(ARBITER_PRIVATE_KEY);
+    const domain = {
+        name: "AegisProtocol",
+        version: "0.3",
+        chainId: 80002,
+        verifyingContract: CORE_ESCROW_ADDRESS
+    };
+
+    const types = {
+        ReleaseRequest: [
+            { name: "transferId", type: "bytes32" },
+            { name: "settlerNode", type: "address" },
+            { name: "settlerAmount", type: "uint256" },
+            { name: "feeTreasury", type: "address" },
+            { name: "feeAmount", type: "uint256" },
+            { name: "deadline", type: "uint256" }
+        ]
+    };
+
+    const bytes32TransferId = ethers.id(transfer_id); 
+    const totalAmountWei = ethers.parseUnits(Number(amount_usdc).toFixed(6), 6);
+    
+    // V3 Dynamic Fee Calculation: 1% Fee (100 basis points)
+    const feeAmount = (totalAmountWei * 100n) / 10000n;
+    const settlerAmount = totalAmountWei - feeAmount;
+    
+    const isProduction = process.env.NODE_ENV === "production";
+    const deadlineDelay = isProduction ? 3600 : (86400 * 365);
+    const deadline = Math.floor(Date.now() / 1000) + deadlineDelay;
+
+    const value = {
+        transferId: bytes32TransferId,
+        settlerNode: agent_wallet,
+        settlerAmount: settlerAmount.toString(),
+        feeTreasury: FEE_TREASURY_ADDRESS,
+        feeAmount: feeAmount.toString(),
+        deadline: deadline
+    };
+
+    const signature = await wallet.signTypedData(domain, types, value);
+
+    return {
+        signature,
+        settlerAmount: settlerAmount.toString(),
+        feeTreasury: FEE_TREASURY_ADDRESS,
+        feeAmount: feeAmount.toString(),
+        deadline
+    };
+}
+
+// 6. Agent verifies OTP to claim funds (QR Flow)
 app.post('/verify-otp', async (req, res) => {
     try {
         const { transfer_id, otp, agent_wallet } = req.body;
@@ -124,48 +173,13 @@ app.post('/verify-otp', async (req, res) => {
         if (transfer.agent_wallet.toLowerCase() !== agent_wallet.toLowerCase()) return res.status(403).json({ error: 'Not your order' });
         if (transfer.otp !== otp) return res.status(401).json({ error: 'Invalid OTP' });
 
-        // Generate Arbiter Signature
-        const wallet = new ethers.Wallet(ARBITER_PRIVATE_KEY);
-        const domain = {
-            name: "AegisProtocol",
-            version: "0.2",
-            chainId: 80002,
-            verifyingContract: CORE_ESCROW_ADDRESS
-        };
-
-        const types = {
-            ReleaseRequest: [
-                { name: "transferId", type: "bytes32" },
-                { name: "settlerNode", type: "address" },
-                { name: "amount", type: "uint256" },
-                { name: "deadline", type: "uint256" }
-            ]
-        };
-
-        const bytes32TransferId = ethers.id(transfer_id); 
-        const amountWei = ethers.parseUnits(Number(transfer.amount_usdc).toFixed(6), 6);
-        
-        // Use 1 Hour for Production, 1 Year for Local Sandbox
-        const isProduction = process.env.NODE_ENV === "production";
-        const deadlineDelay = isProduction ? 3600 : (86400 * 365);
-        const deadline = Math.floor(Date.now() / 1000) + deadlineDelay;
-
-        const value = {
-            transferId: bytes32TransferId,
-            settlerNode: agent_wallet,
-            amount: amountWei,
-            deadline: deadline
-        };
-
-        const signature = await wallet.signTypedData(domain, types, value);
+        const sigData = await generateV3ReleaseSignature(transfer_id, agent_wallet, transfer.amount_usdc);
 
         await query(`UPDATE transfers SET status = 'OTP_VERIFIED' WHERE transfer_id = $1`, [transfer_id]);
 
         res.json({
             success: true,
-            signature,
-            amountWei: amountWei.toString(),
-            deadline
+            ...sigData
         });
 
     } catch (err) {
@@ -193,7 +207,7 @@ app.post('/cashout/upload-slip', async (req, res) => {
     }
 });
 
-// 8. Sender confirms they received payment, generates Arbiter Sig to release crypto
+// 8. Sender confirms they received payment (Slip Flow)
 app.post('/cashout/confirm-payment', async (req, res) => {
     try {
         const { transfer_id, sender_wallet } = req.body;
@@ -205,48 +219,13 @@ app.post('/cashout/confirm-payment', async (req, res) => {
         if (transfer.sender_wallet.toLowerCase() !== sender_wallet.toLowerCase()) return res.status(403).json({ error: 'Not your order' });
         if (transfer.status !== 'SLIP_UPLOADED') return res.status(400).json({ error: 'No slip uploaded yet' });
 
-        // Generate Arbiter Signature
-        const wallet = new ethers.Wallet(ARBITER_PRIVATE_KEY);
-        const domain = {
-            name: "AegisProtocol",
-            version: "0.2",
-            chainId: 80002,
-            verifyingContract: CORE_ESCROW_ADDRESS
-        };
-
-        const types = {
-            ReleaseRequest: [
-                { name: "transferId", type: "bytes32" },
-                { name: "settlerNode", type: "address" },
-                { name: "amount", type: "uint256" },
-                { name: "deadline", type: "uint256" }
-            ]
-        };
-
-        const bytes32TransferId = ethers.id(transfer_id); 
-        const amountWei = ethers.parseUnits(Number(transfer.amount_usdc).toFixed(6), 6);
-        
-        // Use 1 Hour for Production, 1 Year for Local Sandbox
-        const isProduction = process.env.NODE_ENV === "production";
-        const deadlineDelay = isProduction ? 3600 : (86400 * 365);
-        const deadline = Math.floor(Date.now() / 1000) + deadlineDelay;
-
-        const value = {
-            transferId: bytes32TransferId,
-            settlerNode: transfer.agent_wallet,
-            amount: amountWei,
-            deadline: deadline
-        };
-
-        const signature = await wallet.signTypedData(domain, types, value);
+        const sigData = await generateV3ReleaseSignature(transfer_id, transfer.agent_wallet, transfer.amount_usdc);
 
         await query(`UPDATE transfers SET status = 'OTP_VERIFIED' WHERE transfer_id = $1`, [transfer_id]);
 
         res.json({
             success: true,
-            signature,
-            amountWei: amountWei.toString(),
-            deadline,
+            ...sigData,
             agent_wallet: transfer.agent_wallet
         });
     } catch (err) {
@@ -254,6 +233,64 @@ app.post('/cashout/confirm-payment', async (req, res) => {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
+
+// 9. V3: User reports a ghosting agent to claim Inconvenience Slashing Payout
+app.post('/cashout/report-ghost', async (req, res) => {
+    try {
+        const { transfer_id, sender_wallet } = req.body;
+        
+        const { rows } = await query(`SELECT * FROM transfers WHERE transfer_id = $1`, [transfer_id]);
+        if (rows.length === 0) return res.status(404).json({ error: 'Transfer not found' });
+        
+        const transfer = rows[0];
+        if (transfer.sender_wallet.toLowerCase() !== sender_wallet.toLowerCase()) return res.status(403).json({ error: 'Not your order' });
+        if (transfer.status !== 'LOCKED' && transfer.status !== 'ACCEPTED') return res.status(400).json({ error: 'Order not in ghostable state' });
+
+        // Generate V3 Slashing Ticket (Penalty: 5 USDC)
+        const wallet = new ethers.Wallet(ARBITER_PRIVATE_KEY);
+        const domain = {
+            name: "AegisProtocol",
+            version: "0.3",
+            chainId: 80002,
+            verifyingContract: CORE_ESCROW_ADDRESS
+        };
+
+        const types = {
+            SlashRequest: [
+                { name: "slashNonce", type: "bytes32" },
+                { name: "badAgent", type: "address" },
+                { name: "recipient", type: "address" },
+                { name: "payoutAmount", type: "uint256" }
+            ]
+        };
+
+        const slashNonce = ethers.id(transfer_id + "_slash");
+        const payoutAmount = ethers.parseUnits("5.0", 6); // 5 USDC
+
+        const value = {
+            slashNonce,
+            badAgent: transfer.agent_wallet,
+            recipient: sender_wallet,
+            payoutAmount: payoutAmount.toString()
+        };
+
+        const signature = await wallet.signTypedData(domain, types, value);
+
+        await query(`UPDATE transfers SET status = 'CANCELLED' WHERE transfer_id = $1`, [transfer_id]);
+
+        res.json({
+            success: true,
+            signature,
+            slashNonce,
+            badAgent: transfer.agent_wallet,
+            payoutAmount: payoutAmount.toString()
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 
 app.get('/cashout/my-locks/:wallet', async (req, res) => {
     try {
@@ -274,6 +311,6 @@ app.post('/cashout/cancel/:id', async (req, res) => {
 });
 
 if (require.main === module) {
-    app.listen(PORT, () => console.log(`Dispatcher Engine running on port ${PORT}`));
+    app.listen(PORT, () => console.log(`V3 Arbiter Engine running on port ${PORT}`));
 }
 module.exports = app;
