@@ -38,7 +38,10 @@ export const PasskeyManager = {
             name: "user@aegisprotocol.io",
             displayName: "Aegis User"
           },
-          pubKeyCredParams: [{ alg: -7, type: "public-key" }],
+          pubKeyCredParams: [
+            { alg: -7, type: "public-key" },
+            { alg: -257, type: "public-key" }
+          ],
           authenticatorSelection: {
             authenticatorAttachment: "platform",
             userVerification: "required"

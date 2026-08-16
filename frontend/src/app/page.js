@@ -205,8 +205,9 @@ export default function Home() {
       let tx = await usdc.approve(ESCROW_ADDRESS, amountWei);
       await tx.wait();
       
+      const latestNonce = await provider.getTransactionCount(wallet.address, "latest");
       const transferIdBytes = ethers.id(myOrderId);
-      tx = await escrow.lockFunds(transferIdBytes, amountWei);
+      tx = await escrow.lockFunds(transferIdBytes, amountWei, { nonce: latestNonce });
       const receipt = await tx.wait();
 
       const res = await fetch(`${API_BASE}/confirm-lock`, {
@@ -360,6 +361,11 @@ export default function Home() {
             <h1 style={{ fontSize: '3rem', margin: '0 0 25px 0', fontWeight: '700' }}>
               ${balance} <span style={{ fontSize: '1rem', color: 'rgba(255,255,255,0.5)' }}>USDC</span>
             </h1>
+
+            <div style={{ display: 'flex', gap: '10px', marginBottom: '30px' }}>
+              <button className="btn-primary" onClick={() => alert("Send feature simplified for V3 Sandbox.")} style={{ flex: 1, backgroundColor: '#3b82f6' }}>Send</button>
+              <button className="btn-primary" onClick={() => alert("Your Web3 Address: " + wallet.address)} style={{ flex: 1, backgroundColor: '#8b5cf6' }}>Receive</button>
+            </div>
 
             <button className="btn-primary" onClick={() => setActiveTab("cashout")} style={{ width: '100%', marginBottom: '20px', padding: '15px', fontSize: '1.1rem' }}>
               Cash Out to Local Bank
