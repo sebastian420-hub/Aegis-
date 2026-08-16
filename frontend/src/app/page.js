@@ -51,6 +51,10 @@ export default function Home() {
   const [myOtp, setMyOtp] = useState("");
   const [myOrderSlip, setMyOrderSlip] = useState("");
 
+  // Send Crypto State
+  const [sendAddress, setSendAddress] = useState("");
+  const [sendAmount, setSendAmount] = useState("");
+
   // Agent State
   const [feed, setFeed] = useState([]);
   const [activeOrder, setActiveOrder] = useState(null);
@@ -188,6 +192,28 @@ export default function Home() {
   }, [activeTab, activeOrder]);
 
   // --- ACTIONS ---
+
+  const handleSendCrypto = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, wallet);
+      const amountWei = ethers.parseUnits(sendAmount.toString(), 6);
+      
+      const latestNonce = await provider.getTransactionCount(wallet.address, "latest");
+      const tx = await usdc.transfer(sendAddress, amountWei, { nonce: latestNonce });
+      await tx.wait(); 
+      
+      alert(`Successfully sent ${sendAmount} USDC to ${sendAddress}`);
+      setActiveTab("dashboard");
+      setSendAddress("");
+      setSendAmount("");
+      await fetchBalance(wallet);
+    } catch (err) {
+      alert("Transaction Failed: " + err.message);
+    }
+    setLoading(false);
+  };
 
   const handleRequestCashout = async (e) => {
     e.preventDefault();
@@ -388,7 +414,7 @@ export default function Home() {
             </h1>
 
             <div style={{ display: 'flex', gap: '10px', marginBottom: '30px' }}>
-              <button className="btn-primary" onClick={() => alert("Send feature simplified for V3 Sandbox.")} style={{ flex: 1, backgroundColor: '#3b82f6' }}>Send</button>
+              <button className="btn-primary" onClick={() => setActiveTab("send")} style={{ flex: 1, backgroundColor: '#3b82f6' }}>Send</button>
               <button className="btn-primary" onClick={() => alert("Your Web3 Address: " + wallet.address)} style={{ flex: 1, backgroundColor: '#8b5cf6' }}>Receive</button>
             </div>
 
@@ -414,6 +440,24 @@ export default function Home() {
             )}
             
             <p style={{marginTop: '20px', fontSize: '0.7rem', color: 'gray'}}>Passkey Wallet: {wallet.address.slice(0,6)}...{wallet.address.slice(-4)}</p>
+          </div>
+        )}
+
+        {/* ================= SEND CRYPTO ================= */}
+        {activeTab === "send" && (
+          <div>
+            <h3 style={{ marginTop: 0 }}>Send Crypto (On-Chain)</h3>
+            <form onSubmit={handleSendCrypto}>
+              <div className="input-group">
+                <label className="input-label">Wallet Address</label>
+                <input type="text" className="input-field" value={sendAddress} onChange={e => setSendAddress(e.target.value)} placeholder="0x..." required />
+              </div>
+              <div className="input-group">
+                <label className="input-label">Amount (USDC)</label>
+                <input type="number" className="input-field" value={sendAmount} onChange={e => setSendAmount(e.target.value)} placeholder="50" required />
+              </div>
+              <button type="submit" className="btn-primary" disabled={loading}>{loading ? "Broadcasting Tx..." : "Send Instantly"}</button>
+            </form>
           </div>
         )}
 
