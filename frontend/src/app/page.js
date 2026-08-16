@@ -104,11 +104,24 @@ export default function Home() {
     // Auto-Fund from Hardhat for testing
     try {
       const ethBalance = await rpcProvider.getBalance(signer.address);
-      if (ethBalance === 0n) {
+      const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, rpcProvider);
+      const usdcBalance = await usdc.balanceOf(signer.address);
+      
+      if (ethBalance === 0n || usdcBalance === 0n) {
         const richSigner = new ethers.Wallet("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80", rpcProvider);
-        await richSigner.sendTransaction({ to: signer.address, value: ethers.parseEther("1.0") });
-        const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, richSigner);
-        await (await usdc.mint(signer.address, ethers.parseUnits("1000", 6))).wait();
+        
+        if (ethBalance === 0n) {
+           let latestNonce = await rpcProvider.getTransactionCount(richSigner.address, "latest");
+           const fundTx = await richSigner.sendTransaction({ to: signer.address, value: ethers.parseEther("1.0"), nonce: latestNonce });
+           await fundTx.wait();
+        }
+        
+        if (usdcBalance === 0n) {
+           let latestNonce = await rpcProvider.getTransactionCount(richSigner.address, "latest");
+           const usdcWithSigner = usdc.connect(richSigner);
+           const mintTx = await usdcWithSigner.mint(signer.address, ethers.parseUnits("1000", 6), { nonce: latestNonce });
+           await mintTx.wait();
+        }
       }
       await fetchBalance(signer);
     } catch (e) {
